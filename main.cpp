@@ -4,9 +4,12 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #include <set>
 #include <algorithm>
+
+#define Poll_SIZE 2048  // Максимальное количество отслеживаемых дескрипторов
 
 // Функция для установки неблокирующего режима работы файлового дескриптора (сокета)
 int set_nonblock(int fd)
@@ -27,87 +30,75 @@ int set_nonblock(int fd)
 
 int main()
 {
-    // Создаём главный сокет (MasterSocket) для прослушивания подключений
-    // AF_INET - IPv4, SOCK_STREAM - потоковый сокет (TCP), IPPROTO_TCP - протокол TCP
+    // Создание главного сокета для прослушивания подключений
     int MasterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
-    // Множество (set) для хранения дескрипторов подключённых клиентов
+    // Множество для хранения дескрипторов подключённых клиентов
     std::set<int> SlaveSockets;
 
-    // Настраиваем адрес для привязки сокета
+    // Настройка адреса сервера
     struct sockaddr_in SockAddr;
-    SockAddr.sin_family = AF_INET;          // Семейство адресов - IPv4
-    SockAddr.sin_port = htons(12345);       // Порт 12345 (преобразуем в сетевой порядок)
-    SockAddr.sin_addr.s_addr = htonl(INADDR_ANY); // Принимать соединения на все интерфейсы
+    SockAddr.sin_family = AF_INET;          // IPv4
+    SockAddr.sin_port = htons(12345);       // Порт 12345
+    SockAddr.sin_addr.s_addr = htonl(INADDR_ANY); // Принимать соединения на всех интерфейсах
 
-    // Привязываем сокет к адресу
     bind(MasterSocket, (struct sockaddr*)&SockAddr, sizeof(SockAddr));
+    set_nonblock(MasterSocket);  // Неблокирующий режим для главного сокета
+    listen(MasterSocket, SOMAXCONN);  // Очередь подключений
 
-    // Устанавливаем неблокирующий режим для главного сокета
-    set_nonblock(MasterSocket);
+    // Структура для poll()
+    pollfd Set[Poll_SIZE];
+    Set[0].fd = MasterSocket;    // Первый элемент - главный сокет
+    Set[0].events = POLLIN;      // Нас интересуют события ввода (новые подключения)
 
-    // Переводим сокет в режим прослушивания с максимальным количеством ожидающих соединений
-    listen(MasterSocket, SOMAXCONN);
-
-    // Основной цикл обработки событий
     while(true)
     {
-        // Создаём набор файловых дескрипторов для select()
-        fd_set Set;
-        FD_ZERO(&Set); // Инициализируем набор
-
-        // Добавляем главный сокет в набор
-        FD_SET(MasterSocket, &Set);
-
-        // Добавляем все сокеты клиентов в набор
+        // Заполняем массив pollfd клиентскими сокетами
+        unsigned int Index = 1;
         for(auto Iter = SlaveSockets.begin(); Iter != SlaveSockets.end(); ++Iter)
         {
-            FD_SET(*Iter, &Set);
+            Set[Index].fd = *Iter;
+            Set[Index].events = POLLIN;  // Отслеживаем возможность чтения
+            Index++;
         }
 
-        // Находим максимальный номер дескриптора для select()
-        int Max = std::max(MasterSocket, *std::max_element(SlaveSockets.begin(), SlaveSockets.end()));
+        // Размер массива для poll(): MasterSocket + клиентские сокеты
+        unsigned int SetSize = 1 + SlaveSockets.size();
 
-        // Ожидаем активности на любом из сокетов (бесконечно, пока что-то не произойдёт)
-        select(Max + 1, &Set, NULL, NULL, NULL);
+        // Ожидаем события (таймаут -1 означает бесконечное ожидание)
+        poll(Set, SetSize, -1);
 
-        // Проверяем все клиентские сокеты на активность
-        for(auto Iter = SlaveSockets.begin(); Iter != SlaveSockets.end(); ++Iter)
+        // Обработка произошедших событий
+        for(unsigned int i = 0; i < SetSize; ++i)
         {
-            if(FD_ISSET(*Iter, &Set)) // Если сокет готов к чтению
-            {
-                static char Buffer[1024];
-                // Читаем данные из сокета (до 1024 байт)
-                int RecvSize = recv(*Iter, Buffer, 1024, MSG_NOSIGNAL);
+            if(Set[i].revents & POLLIN)
+            {  // Проверяем событие чтения
+                if(i)
+                {  // Если это клиентский сокет
+                    static char Buffer[1024];
+                    int RecvSize = recv(Set[i].fd, Buffer, 1024, MSG_NOSIGNAL);
 
-                // Если получен 0 байт (клиент закрыл соединение) и это не ошибка EAGAIN
-                if((RecvSize == 0) && (errno != EAGAIN))
-                {
-                    // Закрываем соединение
-                    shutdown(*Iter, SHUT_RDWR);
-                    close(*Iter);
-                    // Удаляем сокет из множества
-                    SlaveSockets.erase(Iter);
+                    // Обработка закрытия соединения
+                    if((RecvSize == 0) && (errno != EAGAIN))
+                    {
+                        shutdown(Set[i].fd, SHUT_RDWR);
+                        close(Set[i].fd);
+                        SlaveSockets.erase(Set[i].fd);
+                    }
+                    // Эхо-ответ при получении данных
+                    else if(RecvSize > 0)
+                    {
+                        send(Set[i].fd, Buffer, RecvSize, MSG_NOSIGNAL);
+                    }
                 }
-                else if(RecvSize != 0) // Если получили данные
-                {
-                    // Отправляем их обратно клиенту (эхо-сервер)
-                    send(*Iter, Buffer, RecvSize, MSG_NOSIGNAL);
+                else
+                {  // Если это главный сокет (новое подключение)
+                    int SlaveSocket = accept(MasterSocket, 0, 0);
+                    set_nonblock(SlaveSocket);  // Неблокирующий режим
+                    SlaveSockets.insert(SlaveSocket);  // Добавляем в множество
                 }
             }
         }
-
-        // Проверяем главный сокет на новое подключение
-        if(FD_ISSET(MasterSocket, &Set))
-        {
-            // Принимаем новое подключение
-            int SlaveSocket = accept(MasterSocket, 0, 0);
-            // Устанавливаем неблокирующий режим для нового сокета
-            set_nonblock(SlaveSocket);
-            // Добавляем сокет в множество клиентов
-            SlaveSockets.insert(SlaveSocket);
-        }
     }
-
     return 0;
 }
