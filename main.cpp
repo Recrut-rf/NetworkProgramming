@@ -18,8 +18,11 @@
 #include <errno.h>
 
 
-#define MAX_EVENTS 32  // максимальное количество событий за раз
-#define BUFFER_SIZE 1024
+const int MAX_EVENTS = 32;  // максимальное количество событий за раз
+const int BUFFER_SIZE = 1024;
+
+const int BROADCAST_ALL = -1;
+const int PORT = 12345;
 
 // Функция для установки неблокирующего режима работы файлового дескриптора (сокета)
 int set_nonblock(int fd)
@@ -65,7 +68,7 @@ int main()
     // Настройка адреса сервера
     struct sockaddr_in SockAddr;
     SockAddr.sin_family = AF_INET;          // IPv4
-    SockAddr.sin_port = htons(12345);       // Порт 12345
+    SockAddr.sin_port = htons(PORT);       // Порт 12345
     SockAddr.sin_addr.s_addr = htonl(INADDR_ANY); // Принимать соединения на всех интерфейсах
 
     // Привязываем сокет к адресу
@@ -117,7 +120,7 @@ int main()
                 std::string join_msg = "[" + client_ip + "] has joined the chat\n";
 
                 // Рассылаем сообщение о новом подключении всем клиентам
-                broadcast_message(-1, join_msg, Clients);
+                broadcast_message(BROADCAST_ALL, join_msg, Clients);
             }
             else
             {
@@ -141,7 +144,7 @@ int main()
                     Clients.erase(Events[i].data.fd);
 
                     // Рассылаем сообщение об отключении
-                    broadcast_message(-1, leave_msg, Clients);
+                    broadcast_message(BROADCAST_ALL, leave_msg, Clients);
                 }
                 else if(RecvResult > 0)
                 {
