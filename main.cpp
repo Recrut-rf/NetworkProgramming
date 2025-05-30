@@ -1,15 +1,16 @@
 #include <iostream>
+#include <set>
+#include <algorithm>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <sys/epoll.h>
 
-#include <set>
-#include <algorithm>
 
-#define Poll_SIZE 2048  // Максимальное количество отслеживаемых дескрипторов
+#define MAX_EVENTS 32  // максимальное количество событий за раз
 
 // Функция для установки неблокирующего режима работы файлового дескриптора (сокета)
 int set_nonblock(int fd)
@@ -33,69 +34,70 @@ int main()
     // Создание главного сокета для прослушивания подключений
     int MasterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
-    // Множество для хранения дескрипторов подключённых клиентов
-    std::set<int> SlaveSockets;
-
     // Настройка адреса сервера
     struct sockaddr_in SockAddr;
     SockAddr.sin_family = AF_INET;          // IPv4
     SockAddr.sin_port = htons(12345);       // Порт 12345
     SockAddr.sin_addr.s_addr = htonl(INADDR_ANY); // Принимать соединения на всех интерфейсах
 
+    // Привязываем сокет к адресу
     bind(MasterSocket, (struct sockaddr*)&SockAddr, sizeof(SockAddr));
+
     set_nonblock(MasterSocket);  // Неблокирующий режим для главного сокета
     listen(MasterSocket, SOMAXCONN);  // Очередь подключений
 
-    // Структура для poll()
-    pollfd Set[Poll_SIZE];
-    Set[0].fd = MasterSocket;    // Первый элемент - главный сокет
-    Set[0].events = POLLIN;      // Нас интересуют события ввода (новые подключения)
+    // Создаем epoll-дескриптор
+    int EPoll = epoll_create1(0);
+
+    // Настраиваем событие для главного сокета
+    struct epoll_event Event;
+    Event.data.fd = MasterSocket; // Указываем файловый дескриптор
+    Event.events = EPOLLIN;       // Нас интересуют события ввода (подключения)
+
+    // Добавляем главный сокет в epoll
+    epoll_ctl(EPoll, EPOLL_CTL_ADD, MasterSocket, &Event);
 
     while(true)
     {
-        // Заполняем массив pollfd клиентскими сокетами
-        unsigned int Index = 1;
-        for(auto Iter = SlaveSockets.begin(); Iter != SlaveSockets.end(); ++Iter)
+        // Ожидаем события
+        struct epoll_event Events[MAX_EVENTS];
+        int N = epoll_wait(EPoll, Events, MAX_EVENTS, -1); // -1 означает бесконечное ожидание
+
+        for (unsigned int i = 0; i < N; ++i)
         {
-            Set[Index].fd = *Iter;
-            Set[Index].events = POLLIN;  // Отслеживаем возможность чтения
-            Index++;
-        }
+            // Если событие произошло на главном сокете - новое подключение
+            if(Events[i].data.fd == MasterSocket)
+            {
+                // Принимаем новое подключение
+                int SlaveSocket = accept(MasterSocket, 0, 0);
+                set_nonblock(SlaveSocket); // Устанавливаем неблокирующий режим
 
-        // Размер массива для poll(): MasterSocket + клиентские сокеты
-        unsigned int SetSize = 1 + SlaveSockets.size();
+                // Настраиваем событие для нового сокета
+                struct epoll_event Event;
+                Event.data.fd = SlaveSocket; // Указываем файловый дескриптор
+                Event.events = EPOLLIN;      // Нас интересуют события ввода (данные)
 
-        // Ожидаем события (таймаут -1 означает бесконечное ожидание)
-        poll(Set, SetSize, -1);
+                // Добавляем новый сокет в epoll
+                epoll_ctl(EPoll, EPOLL_CTL_ADD, SlaveSocket, &Event);
+            }
+            else
+            {
+                // Обработка данных от клиента
+                static char Buffer[1024];
+                // Читаем данные (без генерации SIGPIPE при разрыве)
+                int RecvResult = recv(Events[i].data.fd, Buffer, 1024, MSG_NOSIGNAL);
 
-        // Обработка произошедших событий
-        for(unsigned int i = 0; i < SetSize; ++i)
-        {
-            if(Set[i].revents & POLLIN)
-            {  // Проверяем событие чтения
-                if(i)
-                {  // Если это клиентский сокет
-                    static char Buffer[1024];
-                    int RecvSize = recv(Set[i].fd, Buffer, 1024, MSG_NOSIGNAL);
-
-                    // Обработка закрытия соединения
-                    if((RecvSize == 0) && (errno != EAGAIN))
-                    {
-                        shutdown(Set[i].fd, SHUT_RDWR);
-                        close(Set[i].fd);
-                        SlaveSockets.erase(Set[i].fd);
-                    }
-                    // Эхо-ответ при получении данных
-                    else if(RecvSize > 0)
-                    {
-                        send(Set[i].fd, Buffer, RecvSize, MSG_NOSIGNAL);
-                    }
+                // Если соединение закрыто или ошибка (кроме EAGAIN)
+                if((RecvResult == 0) && (errno != EAGAIN))
+                {
+                    // Закрываем соединение корректно
+                    shutdown(Events[i].data.fd, SHUT_RDWR);
+                    close(Events[i].data.fd);
                 }
-                else
-                {  // Если это главный сокет (новое подключение)
-                    int SlaveSocket = accept(MasterSocket, 0, 0);
-                    set_nonblock(SlaveSocket);  // Неблокирующий режим
-                    SlaveSockets.insert(SlaveSocket);  // Добавляем в множество
+                else if(RecvResult > 0)
+                {
+                    // Отправляем обратно полученные данные (эхо-сервер)
+                    send(Events[i].data.fd, Buffer, RecvResult, MSG_NOSIGNAL);
                 }
             }
         }
