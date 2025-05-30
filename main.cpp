@@ -2,6 +2,10 @@
 #include <set>
 #include <algorithm>
 
+#include <string>
+#include <sstream>
+#include <iomanip>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -9,8 +13,13 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 
+#include <arpa/inet.h>
+#include <string.h>
+#include <errno.h>
+
 
 #define MAX_EVENTS 32  // максимальное количество событий за раз
+#define BUFFER_SIZE 1024
 
 // Функция для установки неблокирующего режима работы файлового дескриптора (сокета)
 int set_nonblock(int fd)
@@ -27,6 +36,25 @@ int set_nonblock(int fd)
     flags = 1;
     return ioctl(fd, FIOBIO, &flags);
 #endif
+}
+
+std::string get_client_ip(int fd)
+{
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    getpeername(fd, (struct sockaddr*)&addr, &addr_len);
+    return inet_ntoa(addr.sin_addr);
+}
+
+void broadcast_message(int sender_fd, const std::string& message, const std::set<int>& clients)
+{
+    for (int client_fd : clients)
+    {
+        if (client_fd != sender_fd)
+        { // Не отправляем сообщение отправителю
+            send(client_fd, message.c_str(), message.size(), MSG_NOSIGNAL);
+        }
+    }
 }
 
 int main()
@@ -57,6 +85,8 @@ int main()
     // Добавляем главный сокет в epoll
     epoll_ctl(EPoll, EPOLL_CTL_ADD, MasterSocket, &Event);
 
+    std::set<int> Clients; // Множество всех подключенных клиентов
+
     while(true)
     {
         // Ожидаем события
@@ -79,25 +109,53 @@ int main()
 
                 // Добавляем новый сокет в epoll
                 epoll_ctl(EPoll, EPOLL_CTL_ADD, SlaveSocket, &Event);
+
+                Clients.insert(SlaveSocket);
+
+                // Получаем IP нового клиента
+                std::string client_ip = get_client_ip(SlaveSocket);
+                std::string join_msg = "[" + client_ip + "] has joined the chat\n";
+
+                // Рассылаем сообщение о новом подключении всем клиентам
+                broadcast_message(-1, join_msg, Clients);
             }
             else
             {
                 // Обработка данных от клиента
-                static char Buffer[1024];
+                static char Buffer[BUFFER_SIZE];
                 // Читаем данные (без генерации SIGPIPE при разрыве)
-                int RecvResult = recv(Events[i].data.fd, Buffer, 1024, MSG_NOSIGNAL);
+                int RecvResult = recv(Events[i].data.fd, Buffer, BUFFER_SIZE, MSG_NOSIGNAL);
 
                 // Если соединение закрыто или ошибка (кроме EAGAIN)
-                if((RecvResult == 0) && (errno != EAGAIN))
+                if((RecvResult == 0) || (RecvResult == -1 && errno != EAGAIN))
                 {
+                    // Клиент отключился
+                    std::string client_ip = get_client_ip(Events[i].data.fd);
+                    std::string leave_msg = "[" + client_ip + "] has left the chat\n";
+
                     // Закрываем соединение корректно
                     shutdown(Events[i].data.fd, SHUT_RDWR);
                     close(Events[i].data.fd);
+
+                    // Удаляем из множества клиентов
+                    Clients.erase(Events[i].data.fd);
+
+                    // Рассылаем сообщение об отключении
+                    broadcast_message(-1, leave_msg, Clients);
                 }
                 else if(RecvResult > 0)
                 {
                     // Отправляем обратно полученные данные (эхо-сервер)
-                    send(Events[i].data.fd, Buffer, RecvResult, MSG_NOSIGNAL);
+                    //send(Events[i].data.fd, Buffer, RecvResult, MSG_NOSIGNAL);
+
+                    // Получаем IP отправителя
+                    std::string client_ip = get_client_ip(Events[i].data.fd);
+
+                    // Формируем сообщение с IP
+                    std::string msg = "[" + client_ip + "]: " + std::string(Buffer, RecvResult);
+
+                    // Рассылаем сообщение всем клиентам
+                    broadcast_message(Events[i].data.fd, msg, Clients);
                 }
             }
         }
